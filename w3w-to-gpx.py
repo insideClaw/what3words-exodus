@@ -1,76 +1,84 @@
 #!/usr/bin/env python3
 """
-what3words CSV → GPX converter (no API key needed)
-Scrapes coordinates from the public w3w short-link pages.
+what3words CSV → GPX converter
+Uses Playwright to click Navigate → Google Maps and extract full-precision
+coordinates from the resulting URL.
 
-Usage: python3 w3w_to_gpx.py input.csv output.gpx
+Usage: python3 w3w-to-gpx.py input.csv output.gpx
 
 The CSV must have columns: List, 3 word address, Label
 (standard what3words export format)
+
+Requirements: pip install playwright && playwright install chromium
 """
 
 import csv
 import sys
 import re
-import time
-import urllib.request
-import urllib.error
+import asyncio
 from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.dom import minidom
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-GB,en;q=0.5",
-}
+from playwright.async_api import async_playwright
 
-# Patterns to find lat/lng in the page HTML
-# w3w embeds coords in og:image meta tags and JSON-LD
-PATTERNS = [
-    re.compile(r'center=([-\d.]+),([-\d.]+)'),
-    re.compile(r'"latitude"\s*:\s*([-\d.]+)\s*,\s*"longitude"\s*:\s*([-\d.]+)'),
-    re.compile(r'"lat"\s*:\s*([-\d.]+)\s*,\s*"lng"\s*:\s*([-\d.]+)'),
-    re.compile(r'"coordinates"\s*:\s*\{\s*"lat"\s*:\s*([-\d.]+)\s*,\s*"lng"\s*:\s*([-\d.]+)'),
-]
 
-def w3w_to_coords(address):
-    """Fetch coordinates for a w3w address by scraping the public page."""
+GOOGLE_MAPS_PATTERN = re.compile(r'destination=([-\d.]+),([-\d.]+)')
+
+
+async def dismiss_overlays(page):
+    """Remove all blocking overlays via JS."""
+    await page.evaluate("""
+        // FundingChoices consent
+        document.querySelectorAll('.fc-consent-root, .fc-dialog-overlay, [class*="consent"]').forEach(el => el.remove());
+        // w3w's own modals (fixed inset-0 z-50 overlays)
+        document.querySelectorAll('[data-state="open"][aria-hidden="true"], div.fixed.inset-0.z-50').forEach(el => el.remove());
+        // Any radix-ui dialog overlays
+        document.querySelectorAll('[data-radix-portal]').forEach(el => el.remove());
+    """)
+    await page.wait_for_timeout(500)
+
+
+async def w3w_to_coords(page, address, first_run=False):
+    """Navigate to w3w page, click Navigate, pick Google Maps, extract coords."""
     address = address.lstrip("/").strip()
-    url = f"https://w3w.co/{address}"
+    url = f"https://what3words.com/{address}"
 
-    req = urllib.request.Request(url, headers=HEADERS)
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            final_url = resp.geturl()
-            html = resp.read().decode("utf-8", errors="ignore")
+        await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+        await page.wait_for_timeout(2000)
 
-    # Many modern w3w pages redirect to a URL containing @lat,lon
-    m = re.search(r'@([-\d.]+),([-\d.]+)', final_url)
-    if m:
-        return float(m.group(1)), float(m.group(2))
-    except urllib.error.HTTPError as e:
-        print(f"    HTTP {e.code} for '{address}'")
-        return None, None
-    except Exception as e:
-        print(f"    Request failed for '{address}': {e}")
-        return None, None
+        if first_run:
+            await dismiss_overlays(page)
+            await page.wait_for_timeout(500)
 
-    for pat in PATTERNS:
-        m = pat.search(html)
-        if m:
-            try:
+        # Click the Navigate button (data-testid="navigate-button" from the error log)
+        nav_btn = page.locator('[data-testid="navigate-button"]')
+        await nav_btn.wait_for(state="visible", timeout=10000)
+        await nav_btn.click(force=True)
+        await page.wait_for_timeout(2000)
+
+        # Look for Google Maps link in the navigation dropdown/panel
+        gmaps_link = page.locator('a[href*="google.com/maps"], a[href*="maps.google"]').first
+        await gmaps_link.wait_for(state="visible", timeout=10000)
+        href = await gmaps_link.get_attribute("href")
+
+        if href:
+            m = GOOGLE_MAPS_PATTERN.search(href)
+            if m:
                 return float(m.group(1)), float(m.group(2))
-            except ValueError:
-                continue
 
-    # Last resort: dump a snippet so the user can see what's there
-    print(f"    Could not parse coordinates for '{address}' — page snippet:")
-    snippet = html[html.find("<head"):html.find("<head") + 2000] if "<head" in html else html[:2000]
-    print(f"    {snippet[:300]}")
+        # Fallback: check for any link with destination= pattern
+        all_links = await page.locator('a[href*="destination="]').all()
+        for link in all_links:
+            href = await link.get_attribute("href")
+            if href:
+                m = GOOGLE_MAPS_PATTERN.search(href)
+                if m:
+                    return float(m.group(1)), float(m.group(2))
+
+    except Exception as e:
+        print(f"    Error: {e}")
+
     return None, None
 
 
@@ -82,67 +90,74 @@ def build_gpx(waypoints):
     })
     for wp in waypoints:
         wpt = SubElement(gpx, "wpt", {
-            "lat": str(wp["lat"]),
-            "lon": str(wp["lon"]),
+            "lat": f"{wp['lat']:.7f}",
+            "lon": f"{wp['lon']:.7f}",
         })
         name = SubElement(wpt, "name")
         name.text = wp["label"] or wp["address"]
         desc = SubElement(wpt, "desc")
-        desc.text = f"w3w: ///{wp['address']} | List: {wp['list']}"
+        addr = wp['address'].lstrip("/")
+        desc.text = f"w3w: ///{addr} | List: {wp['list']}"
     return gpx
 
 
-def main():
+async def main():
     if len(sys.argv) != 3:
-        print("Usage: python3 w3w_to_gpx.py input.csv output.gpx")
+        print("Usage: python3 w3w-to-gpx.py input.csv output.gpx")
         sys.exit(1)
 
-    input_csv  = sys.argv[1]
+    input_csv = sys.argv[1]
     output_gpx = sys.argv[2]
 
     print(f"Reading {input_csv} ...")
     with open(input_csv, newline="", encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
 
-    print(f"Found {len(rows)} locations. Fetching coordinates...\n")
+    print(f"Found {len(rows)} locations. Launching browser...\n")
 
     waypoints = []
-    skipped   = 0
+    skipped = 0
 
-    for i, row in enumerate(rows, 1):
-        address = (
-            row.get("3 word address")
-            or row.get("3word address")
-            or row.get("words")
-            or ""
-        ).strip()
-        label = (row.get("Label") or row.get("label") or "").strip()
-        lst   = (row.get("List")  or row.get("list")  or "").strip()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            locale="en-GB",
+        )
+        page = await context.new_page()
 
-        if not address:
-            print(f"[{i}/{len(rows)}] SKIP — empty address")
-            skipped += 1
-            continue
+        for i, row in enumerate(rows, 1):
+            address = (
+                row.get("3 word address")
+                or row.get("3word address")
+                or row.get("words")
+                or ""
+            ).strip()
+            label = (row.get("Label") or row.get("label") or "").strip()
+            lst = (row.get("List") or row.get("list") or "").strip()
 
-        print(f"[{i}/{len(rows)}] {address}  ({label or 'no label'})", end=" ... ", flush=True)
-        lat, lon = w3w_to_coords(address)
+            if not address:
+                print(f"[{i}/{len(rows)}] SKIP — empty address")
+                skipped += 1
+                continue
 
-        if lat is None:
-            print("SKIP")
-            skipped += 1
-        else:
-            print(f"{lat}, {lon}")
-            waypoints.append({
-                "address": address,
-                "label":   label,
-                "list":    lst,
-                "lat":     lat,
-                "lon":     lon,
-            })
+            print(f"[{i}/{len(rows)}] {address}  ({label or 'no label'})", end=" ... ", flush=True)
+            lat, lon = await w3w_to_coords(page, address, first_run=(i == 1))
 
-        # Polite delay — avoid hammering their servers
-        if i < len(rows):
-            time.sleep(2)
+            if lat is None:
+                print("FAILED")
+                skipped += 1
+            else:
+                print(f"{lat:.7f}, {lon:.7f}")
+                waypoints.append({
+                    "address": address,
+                    "label": label,
+                    "list": lst,
+                    "lat": lat,
+                    "lon": lon,
+                })
+
+        await browser.close()
 
     print(f"\nConverted {len(waypoints)} locations ({skipped} skipped).")
 
@@ -151,7 +166,7 @@ def main():
         sys.exit(1)
 
     raw_xml = tostring(build_gpx(waypoints), encoding="unicode")
-    pretty  = minidom.parseString(raw_xml).toprettyxml(indent="  ")
+    pretty = minidom.parseString(raw_xml).toprettyxml(indent="  ")
 
     with open(output_gpx, "w", encoding="utf-8") as f:
         f.write(pretty)
@@ -161,4 +176,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
