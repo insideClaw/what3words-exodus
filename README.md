@@ -8,6 +8,8 @@ what3words has changed to an aggressive monetization model with severely limited
 
 Before you do this, you'll need a CSV export from what3words. Again, they have locked that in the Pro tier, but just the 7 day trial should allow you to get that and immediately cancel.
 
+Disclaimer: 100% vibe coded
+
 ## Setup
 
 ```bash
