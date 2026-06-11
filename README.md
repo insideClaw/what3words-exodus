@@ -1,6 +1,10 @@
 # what3words Exodus
 
-Export your saved what3words locations to GPX — no API key required.
+Export your saved what3words locations to GPX — no API key, no subscription, no Pro plan needed.
+
+Free tool to migrate away from what3words. Convert w3w addresses to GPS coordinates and escape the what3words walled garden.
+
+**Looking for:** what3words alternative, what3words export, what3words to GPS, w3w to GPX converter, what3words free coordinate lookup, what3words saved places backup, leave what3words, what3words migration tool, what3words to OsmAnd, what3words to CoMaps, what3words to Google Maps, cancel what3words pro
 
 ## Why
 
