@@ -38,7 +38,7 @@ async def dismiss_overlays(page):
     await page.wait_for_timeout(500)
 
 
-async def w3w_to_coords(page, address, first_run=False):
+async def w3w_to_coords(page, address):
     """Navigate to w3w page, click Navigate, pick Google Maps, extract coords."""
     address = address.lstrip("/").strip()
     url = f"https://what3words.com/{address}"
@@ -46,10 +46,7 @@ async def w3w_to_coords(page, address, first_run=False):
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=20000)
         await page.wait_for_timeout(2000)
-
-        if first_run:
-            await dismiss_overlays(page)
-            await page.wait_for_timeout(500)
+        await dismiss_overlays(page)
 
         # Click the Navigate button (data-testid="navigate-button" from the error log)
         nav_btn = page.locator('[data-testid="navigate-button"]')
@@ -142,7 +139,7 @@ async def main():
                 continue
 
             print(f"[{i}/{len(rows)}] {address}  ({label or 'no label'})", end=" ... ", flush=True)
-            lat, lon = await w3w_to_coords(page, address, first_run=(i == 1))
+            lat, lon = await w3w_to_coords(page, address)
 
             if lat is None:
                 print("FAILED")
